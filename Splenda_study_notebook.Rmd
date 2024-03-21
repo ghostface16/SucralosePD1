@@ -1,0 +1,1462 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("celldex")
+BiocManager::install("SingleR")
+install_version('ggplot2', version = '3.4.4')
+
+install_github("satijalab/azimuth")
+devtools::install_github("PaulingLiu/scibet")
+devtools::install_github(repo = "Hanxi-002/SLIDEHelper", force = T, dependencies = F)
+install.packages("effsize")
+install.packages('qgraph')
+install.packages('comprehenr')
+```
+
+```{r, message=FALSE}
+library(Seurat)
+library(SeuratDisk)
+library(data.table)
+library(RColorBrewer)
+library(ggplot2)
+library(plotly)
+library(devtools)
+library(magrittr)
+library(dplyr)
+library(SingleR)
+library(Azimuth)
+library(limma)
+library(SLIDEHelper)
+library(SLIDE)  
+library(dittoSeq)
+library(stringr)
+library(effsize)
+library(combinat)
+library(doParallel)
+library(qgraph)
+library(comprehenr)
+```
+
+```{r}
+path = '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/'
+```
+
+```{r}
+# read in the data (raw matrices, 5 experiments)
+pool_4 = Read10X_h5(paste0(path,'sc_splenda_cellranger_output_4-SP_T/outs/multi/count/raw_feature_bc_matrix.h5'))           
+pool_3 = Read10X_h5(paste0(path,'sc_splenda_cellranger_output_3-PD-1-T/outs/multi/count/raw_feature_bc_matrix.h5'))
+pool_2 = Read10X_h5(paste0(path,'sc_splenda_cellranger_output_2-SP_LN/outs/multi/count/raw_feature_bc_matrix.h5'))
+pool_1 = Read10X_h5(paste0(path,'sc_splenda_cellranger_output_1-PD1-LN/outs/multi/count/raw_feature_bc_matrix.h5'))
+
+
+pool_4_bis = Read10X_h5(paste0(path,'CELL_Ranger_TUM_2/sc_splenda_cellranger_output_4-SP-1-T_bis/outs/multi/count/raw_feature_bc_matrix.h5'))           
+pool_3_bis = Read10X_h5(paste0(path,'CELL_Ranger_TUM_2/sc_splenda_cellranger_output_3-PD-1-T_bis/outs/multi/count/raw_feature_bc_matrix.h5'))
+#pool_1_molecule_info = Read10X_h5(paste0(path,'sc_splenda_cellranger_output_1-PD1-LN/outs/multi/count/raw_molecule_info.h5'))
+#pool_2_molecule_info = Read10X_h5(paste0(path,'sc_splenda_cellranger_output_2-SP_LN/outs/multi/count/raw_molecule_info.h5'))
+#pool_3_molecule_info = Read10X_h5(paste0(path,'sc_splenda_cellranger_output_3-PD-1-T/outs/multi/count/raw_molecule_info.h5'))
+#pool_4_molecule_info = Read10X_h5(paste0(path,'sc_splenda_cellranger_output_4-SP_T/outs/multi/count/raw_molecule_info.h5'))
+
+```
+
+```{r}
+####################################################################################################
+#                                                                                                  #
+#                           CODE TO FILTER AND DEMULTIPLEX RAW MATRICES                            #
+#                                                                                                  #
+###################################################################################################
+
+# arange raw matrices in a list
+samps = list(pool_3_bis, pool_4_bis)
+# arange patient labels in a list
+filtered_obj_vec = NULL 
+# Maximum number of genes expressed in a cell, cells above or equal this threshold are filtered out
+max_expr = 4000000000
+# Minimum number of genes expressed in a cell, cells below or equal this threshold are filtered out
+min_expr = 100
+# Minimum percentage of cells in which a gene is expressed, genes below this threshold are filtered out
+gene_percent_thresh = 0.01
+
+count = 0
+dataset = 'TUM'
+
+for (i in samps){
+    seurat_obj = CreateSeuratObject(i[["Gene Expression"]])
+    seurat_obj <- PercentageFeatureSet(seurat_obj, "^mt", col.name = "percent_mito")
+    seurat_obj <- PercentageFeatureSet(seurat_obj, "^Rp[sl]", col.name = "percent_ribo")
+    # Cell sparcity filtering
+    selected_c <- WhichCells(seurat_obj, expression = min_expr<nFeature_RNA)
+    # Gene sparcity filtering
+    selected_c_2 <- WhichCells(seurat_obj, expression =nFeature_RNA<max_expr)
+    # Filtering high mitochondrial content cells
+    selected_c_3 = WhichCells(seurat_obj, expression = percent_mito<20)
+   #selected_c_4 = WhichCells(seurat_obj, expression = percent_ribo>5)
+  
+    cell_select = intersect(selected_c,selected_c_2)
+    cell_select = intersect(cell_select, selected_c_3)
+   #cell_select = intersect(cell_select, selected_c_4)
+  # Making sure HTOs and cells in count matrix do match\
+    joint_1 = intersect(colnames(i[["Multiplexing Capture"]][,cell_select]), 
+                      colnames(i[["Gene Expression"]][,cell_select]))
+   # Gene sparcity filtering
+    selected_f <- rownames(seurat_obj)[Matrix::rowSums(seurat_obj) > dim(seurat_obj)[1]*gene_percent_thresh]
+    # patient x HTO matrix
+    data.filt_hto = i[["Multiplexing Capture"]][,joint_1]
+   # Curated count matrix 
+    data.filt <- subset(seurat_obj, features = selected_f, cells = joint_1)
+   # Curated HTO matrix 
+    data.filt[["HTO"]] =  CreateAssayObject(counts = data.filt_hto)
+     #  log normalization 
+    data.filt <- NormalizeData(data.filt, normalization.method = 'LogNormalize')
+    #ONLY FOR POOL2 because exponentiation yields infinite values
+    if (count==0 & dataset=='DLN'){
+    data.filt[["HTO"]] <- NormalizeData(data.filt[["HTO"]], normalization.method = 'LogNormalize')
+    }
+    # demultiplexing
+    demuxed_seurat  <- HTODemux(data.filt, assay = "HTO")
+    new_sel_no_doublet = WhichCells(demuxed_seurat, 
+                     expression = HTO_classification.global!='Doublet')
+    alt_seurat = subset(demuxed_seurat, cells = new_sel_no_doublet)
+    new_sel_no_neg = WhichCells(demuxed_seurat, 
+                     expression = HTO_classification.global!='Negative')
+    #alt_seurat = demuxed_seurat
+    alt_seurat = subset(alt_seurat, cells = new_sel_no_neg)
+    subset(alt_seurat, cells = new_sel_no_neg)
+    alt_seurat@meta.data$orig.ident = alt_seurat$HTO_maxID
+    #collecting demultiplxed experiments
+    filtered_obj_vec = append(filtered_obj_vec, alt_seurat)
+    count = count + 1
+}
+# merge all matrices together
+combined_seurat <- merge(filtered_obj_vec[[1]], y=filtered_obj_vec[2], project = 'Splenda')
+combined_seurat <- ScaleData(combined_seurat)#, features = VariableFeatures(combined_seurat))
+combined_seurat <- FindVariableFeatures(combined_seurat, selection.method = "mean.var.plot")
+filename = file.path('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/cell_ranger_2nd_run_tumor/h5_folder/1_percent_gene_thresh/','TUM_2nd_run')
+SaveH5Seurat(combined_seurat, filename = filename, overwrite = T)
+```
+
+```{r}
+combined_seurat@assays$RNA
+seurat_obj = CreateSeuratObject(i[["Gene Expression"]])
+```
+
+```{r}
+# Result of demultiplexing
+table(combined_seurat$HTO_classification.global)
+```
+
+```{r}
+filename_TUM = file.path('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/h5_folder','TUM.h5seurat')
+filename_DLN = paste0(filename,'.h5seurat')#file.path('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/h5_folder','DLN.h5seurat')
+filename_TUM_2nd_run = file.path('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/cell_ranger_2nd_run_tumor/h5_folder/1_percent_gene_thresh/','TUM_2nd_run.h5seurat')
+
+dln_seurat = LoadH5Seurat(file = filename_DLN)
+tum_seurat_clean = LoadH5Seurat(file = filename_TUM_2nd_run)
+```
+
+# QC PLOTS
+
+```{r}
+#identifiers for mouse ribo, mito etc genes are diff from humn
+dln_seurat <- PercentageFeatureSet(dln_seurat, "^mt-", col.name = "percent_mito", assay = 'RNA')
+dln_seurat <- PercentageFeatureSet(dln_seurat, "^Rp[sl]", col.name = "percent_ribo")
+dln_seurat <- PercentageFeatureSet(dln_seurat, "^Hbb[^(p)]", col.name = "percent_hb")
+dln_seurat <- PercentageFeatureSet(dln_seurat, "Pecam1|Pf4", col.name = "percent_plat")
+
+feats <- c("nFeature_RNA", "nCount_RNA", "percent_mito", "percent_ribo")
+options(repr.plot.width = 15, repr.plot.height =15)
+VlnPlot(dln_seurat, features = feats, pt.size = 0, ncol = 2) + NoLegend()
+
+tum_seurat_clean <- PercentageFeatureSet(tum_seurat_clean, "^mt-", col.name = "percent_mito", assay = 'RNA')
+tum_seurat_clean <- PercentageFeatureSet(tum_seurat_clean, "^Rp[sl]", col.name = "percent_ribo")
+tum_seurat_clean <- PercentageFeatureSet(tum_seurat_clean, "^Hbb[^(p)]", col.name = "percent_hb")
+tum_seurat_clean <- PercentageFeatureSet(tum_seurat_clean, "Pecam1|Pf4", col.name = "percent_plat")
+
+VlnPlot(tum_seurat_clean, features = feats, pt.size = 0, ncol = 2) + NoLegend()
+```
+
+# DIMENSIONALITY REDUCTION
+
+```{r}
+dln_seurat <- RunPCA(dln_seurat)
+dln_seurat <- RunUMAP(dln_seurat, reduction = 'pca', dims = 1:11) 
+dln_seurat <- RunTSNE(dln_seurat, dims = 1:11, reduction = 'pca')#, tsne.method = 'FIt-SNE')
+
+tum_seurat_clean <- RunPCA(tum_seurat_clean)
+tum_seurat_clean <- RunUMAP(tum_seurat_clean, reduction = 'pca', dims = 1:11) 
+tum_seurat_clean <- RunTSNE(tum_seurat_clean, dims = 1:11, reduction = 'pca')#, tsne.method = 'FIt-SNE')
+```
+
+# Save files
+
+```{r}
+SaveH5Seurat(tum_seurat_clean, filename = filename_TUM_2nd_run, overwrite = T)
+SaveH5Seurat(dln_seurat, filename = filename_DLN, overwrite = T)
+```
+
+# QC PLOTS
+
+```{r}
+palette <- brewer.pal(n = 30, name = "Set1")
+plot1 <- FeatureScatter(dln_seurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",
+                        plot.cor=TRUE,cols = "Red",group.by="orig.ident",
+                        raster=FALSE)+geom_smooth(method='lm')+
+  scale_color_manual(values = palette)+
+  theme(legend.text = element_text(size = 9))
+
+plot2 <- FeatureScatter(tum_seurat_clean , feature1 = "nCount_RNA", feature2 = "nFeature_RNA",cols = "Red",
+                        plot.cor=TRUE,group.by ="orig.ident",raster=FALSE)+           geom_smooth(method='lm')+scale_color_manual(values = palette)+
+  theme(legend.text = element_text(size = 9))
+plot2 #+ plot1
+```
+
+# LOADING SEURAT OBJ WITH CLUSTERS DEFINED AND PERFORM CLUSTER ANNOTATION
+
+```{r}
+dln_seurat_clust = LoadH5Seurat(file = '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/h5_folder/DLN_clusters.h5seurat')
+
+tum_seurat_clean_clust = LoadH5Seurat(file ='/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/cell_ranger_2nd_run_tumor/h5_folder/1_percent_gene_thresh/TUM_2nd_run_clusters.h5seurat')
+```
+
+# DIMENSIONALITY REDUCTION
+
+```{r}
+DimPlot(dln_seurat_clust, group.by = "orig.ident", reduction = 'umap')
+DimPlot(dln_seurat_clust, group.by = "orig.ident", reduction = 'tsne')
+DimPlot(dln_seurat_clust, reduction = "pca", group.by = "orig.ident")
+
+DimPlot(tum_seurat_clean_clust, group.by = "seurat_clusters", reduction = 'umap')
+DimPlot(tum_seurat_clean_clust, group.by = "seurat_clusters", reduction = 'tsne')
+DimPlot(tum_seurat_clean_clust, reduction = "pca", group.by = "seurat_clusters")
+
+DimPlot(tum_seurat_clean_clust, group.by = "orig.ident", reduction = 'umap')
+DimPlot(tum_seurat_clean_clust, group.by = "orig.ident", reduction = 'tsne')
+DimPlot(tum_seurat_clean_clust, reduction = "pca", group.by = "orig.ident")
+#label
+```
+# PCA SCREE
+
+```{r}
+pca_var <- (tum_seurat_clean_clust@reductions$pca@stdev^2/sum(tum_seurat_clean_clust@reductions$pca@stdev^2))*100
+pca_var = sort(pca_var, decreasing = TRUE)
+cum_var = cumsum(pca_var)
+# Plot variance as a bar plot
+pca_var_df <- data.frame(PC = paste0("PC", seq_along(pca_var)), Variance = pca_var)
+ggplot(pca_var_df, aes(x = 1:50, y = Variance)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  xlab("Principal Component") +
+  ylab("% of total variance") +
+  ggtitle("Variance of principal components") + geom_point(aes(x = 1:50, y = cum_var), size = 0.8, color="red", group = 1)+ geom_line(aes(x = 1:50, y = cum_var), size = 0.4, color="red", group = 1)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+# LABELLING BY TREATMENT TYPE
+
+```{r}
+people =  tum_seurat_clean_clust@meta.data$HTO_maxID
+grouping = NULL
+
+for (i in people){
+  len_i = nchar(i)
+  if (len_i == 10){
+    check = substr(i, len_i-1, len_i)#strsplit(i,'')[[1]][1:2]
+  } else{
+    check = substr(i, len_i, len_i)
+  }
+  #print(check)
+  if (check %in% c('10', '11', '12')){
+      label = '4-SP-T'#'3-PD1-T'
+  }else{
+      label = '3-PD1-T'
+  }  
+  grouping = append(grouping, label)
+}
+
+tum_seurat_clean_clust[['label']] = grouping
+```
+
+```{r}
+DimPlot(tum_seurat_clean_clust, group.by = 'label', reduction = 'umap')
+DimPlot(tum_seurat_clean_clust, group.by = 'label', reduction = 'tsne')
+DimPlot(tum_seurat_clean_clust, reduction = "pca", group.by = 'label')
+```
+# VISUALIZING CLUSTER IN LOW DIM PROJECTION
+
+```{r}
+DimPlot(dln_seurat_clust, group.by = 'seurat_clusters', reduction = 'umap')
+DimPlot(dln_seurat_clust, group.by = 'seurat_clusters', reduction = 'tsne')
+DimPlot(dln_seurat_clust, reduction = "pca", group.by = 'seurat_clusters')
+
+DimPlot(tum_seurat_clean_clust, group.by = 'seurat_clusters', reduction = 'umap')
+DimPlot(tum_seurat_clean_clust, group.by = 'seurat_clusters', reduction = 'tsne')
+DimPlot(tum_seurat_clean_clust, reduction = "pca", group.by = 'seurat_clusters')
+```
+# CELL TYPE ANNOTATION USING SINGLE R AND CELLDEX REFERENCE (DO NOT USE)
+
+```{r}
+inRef <- celldex::HumanPrimaryCellAtlasData()
+
+#Create SummarizedExperiment
+refDF = inRef %>% colData() %>% as.data.frame()
+ref <- SummarizedExperiment(assays=assays(inRef), colData=refDF)
+immune_subset = which(ref$label.main == "T cells" | ref$label.main =="Macrophages" | ref$label.main == "B cells" | ref$label.main == "Monocytes" | ref$label.main == "NK cells" )#| ref$label.main == "NKT")
+ref = ref[,immune_subset]
+counts <- GetAssayData(tum_seurat_clean_clust)#dln_seurat_clust)
+                               
+results <- SingleR(test = counts, ref = ref, labels = ref$label.main[immune_subset])
+                  #, clusters = dln_seurat_clust@meta.data$seurat_clusters)
+
+tum_seurat_clean_clust[['SingleR_annotation']] <- results$labels
+#SaveH5Seurat(alt_seurat, filename = 'STEMI_seurat_alt')
+```
+
+# CELL TYPE ANNOTATION USING SINGLE R AND Panglao dataset
+# manual annot based on Panglao markers
+
+```{r}
+immune_cells = c("T cells", "Macrophages", "B cells", "Monocytes", "NK cells", "Alveolar macrophages", "B cells memory", "B cells naive", "Dendritic cells", "Gamma delta T cells",
+"Mast cells", "T regulatory cells", "T memory cells", "T helper cells",
+"T follicular helper cells", "T cytotoxic cells", "T cells naive", 
+"Natural killer T cells", "Monocytes")
+
+##############################################################################
+############# converting human genes id to mouse
+##############################################################################
+convertHumanGeneList <- function(x){
+
+   human <- useMart("ensembl", dataset = "hsapiens_gene_ensembl",
+                    host = "https://dec2021.archive.ensembl.org/")#, mirror='useast')
+   mouse <- useMart("ensembl", dataset = "mmusculus_gene_ensembl",
+                     host = "https://dec2021.archive.ensembl.org/")#, mirror='useast')
+
+   genesV2 <- getLDS(attributes = c("hgnc_symbol"), filters = "hgnc_symbol", 
+                 values = x , mart = human, attributesL = c("mgi_symbol"), martL = mouse, uniqueRows=F)
+
+   humanx <- unique(genesV2)#[, 2]#unique(genesV2[, 2])
+
+   return(humanx)
+}
+x = read_tsv('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/PanglaoDB_markers_27_Mar_2020.tsv')
+thing = convertHumanGeneList(x$`official gene symbol`)
+```
+
+```{r}
+human_to_use = which(x$`official gene symbol`%in%thing$HGNC.symbol)
+x_to_use = x[human_to_use,]
+mouse_gene_vector = NULL
+human_to_check_against = unique(thing$HGNC.symbol)
+
+for (i in x_to_use$`official gene symbol`){
+    ind = which(human_to_check_against==i)   
+    mouse_gene_vector = append(mouse_gene_vector,thing$MGI.symbol[ind])
+}
+
+x_to_use[,'mouse_gene'] = mouse_gene_vector
+lol = which(x_to_use$specificity_mouse<0.1 & x_to_use$sensitivity_mouse>0.6 & x_to_use$`cell type`%in%immune_cells)
+#w = alias2SymbolTable(x$`official gene symbol`, species="Hs")
+#x[lol,'alias2Symbol'] = convertHumanGeneList(x$`official gene symbol`[lol])
+T_cells_markers = which(x_to_use$`cell type`[lol]=="T cells")
+ref_T_cells_markers = x_to_use$mouse_gene[T_cells_markers]
+#count = 1
+
+#for (i in ref_T_cells_markers){
+#    new = paste(toupper(substr(i, 1, 1)), tolower(substr(i, 2, nchar(i))), sep="")
+#    ref_T_cells_markers[count] = new
+#    count = count + 1
+#}
+
+#newid  = alias2SymbolTable(rownames(dln_seurat_clust), species="Mm")
+#counts <- GetAssayData(dln_seurat_clust,assay = "RNA",slot = "counts") 
+#rownames(counts) <- newid 
+#labeled = which(is.na(rownames(counts))==FALSE)
+#counts = counts[labeled,]
+#dln_seurat_clust_new_id <- CreateSeuratObject(counts = counts, meta.data = dln_seurat_clust@meta.data)
+
+#dln_seurat_clust@meta.data$seurat_clusters
+VlnPlot(dln_seurat_clust, features = ref_T_cells_markers)#, idents = "seurat_clusters")
+```
+
+
+```{r}
+DimPlot(dln_seurat_clean_clust, group.by = 'SingleR_annotation', reduction = 'umap')
+DimPlot(dln_seurat_clust, group.by = 'SingleR_annotation', reduction = 'tsne')
+DimPlot(dln_seurat_clust, reduction = "pca", group.by = 'SingleR_annotation')
+
+DimPlot(tum_seurat_clean_clust, group.by = 'SingleR_annotation', reduction = 'umap')
+DimPlot(tum_seurat_clean_clust, group.by = 'SingleR_annotation', reduction = 'tsne')
+DimPlot(tum_seurat_clean_clust, reduction = "pca", group.by = 'SingleR_annotation')
+```
+
+# Investigating distribution of cell types per cluster 
+
+```{r}
+# create a dataset
+clusters = dln_seurat_clust@meta.data$seurat_clusters
+cell_type = dln_seurat_clust@meta.data$SingleR_annotation
+uniq_cell_types = unique(cell_type)
+len_uniq_cell_types = length(uniq_cell_types)
+
+freq_df <- data.frame(matrix(ncol = len_uniq_cell_types, nrow = 0))
+colnames(freq_df) = uniq_cell_types
+
+for (i in unique(clusters)){
+    cells_ind_in_i = which(clusters==i)
+    cell_types_in_i = cell_type[cells_ind_in_i]
+    cell_type_freq_in_i = table(cell_types_in_i)
+    vec = cell_type_freq_in_i
+    how_many_cell_types_in_i =length(names(cell_type_freq_in_i))
+    
+    if (how_many_cell_types_in_i != len_uniq_cell_types){
+       vec = rep(0, len_uniq_cell_types)
+       names(vec) = uniq_cell_types
+       count = 1
+       
+       for (i in colnames(freq_df)){
+          if ( i %in% names(cell_type_freq_in_i)){
+             vec[count] = cell_type_freq_in_i[i]
+          }
+          count = count + 1
+       }
+    } 
+    freq_df = rbind(freq_df, vec)
+    colnames(freq_df) = uniq_cell_types
+}
+
+freq_df = diag(1/rowSums(freq_df)) %*% as.matrix.data.frame(freq_df)
+freq_df = freq_df * 100
+
+library(tidyverse)
+
+ok = freq_df %>% as.data.frame %>%
+  rownames_to_column(var = "id") %>%
+  pivot_wider(names_from = id, values_from = !id)
+
+ok = ok %>% as.data.frame() %>% t()
+here = rep(paste0('cluster', 1:16), 320/16)
+ok = cbind(ok, here)
+colnames(ok) = c('percentage', 'cluster')
+ok = ok %>% as.data.frame()
+to_fill = unlist(strsplit(rownames(ok), '_'))
+fill_ind = which(is.na(as.numeric(to_fill)))
+try = ok %>% group_by('cluster')
+#ok = ok * 100
+#ok[,'percentage'] <- as.numeric(ok[,'percentage'])
+
+# Stacked
+library(dittoSeq)
+dittoBarPlot(tum_seurat_clean_clust, 
+             var = 'SingleR_annotation', group.by = "seurat_clusters") #+
+   # scale_fill_manual(values = metadata(dln_seurat_clust)$color_vectors$celltype)
+
+```
+
+
+```{r}
+immune_cells = c("T cells", "Macrophages", "B cells", "Monocytes", "NK cells", "Alveolar macrophages",
+                 "B cells memory", "B cells naive", "Dendritic cells", "Gamma delta T cells",
+                 "Mast cells", "T regulatory cells", "T memory cells", "T helper cells",
+                 "T follicular helper cells", "T cytotoxic cells", "T cells naive", "Natural killer T cells",
+                 "Monocytes")
+
+lol = which(x$specificity_mouse<0.1 & x$sensitivity_mouse>0.6 & x$`cell type`%in%immune_cells)
+unique(x$`cell type`[lol])
+```
+
+
+# Load datasets
+
+
+```{r}
+dln_seurat_clust = LoadH5Seurat(file = '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/h5_folder/DLN_clusters.h5seurat')
+
+tum_seurat_clean_clust = LoadH5Seurat(file = '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/cell_ranger_2nd_run_tumor/h5_folder/1_percent_gene_thresh/TUM_2nd_run_clusters.h5seurat')
+```
+
+
+# LABELLING BY TREATMENT TYPE
+
+
+```{r}
+dataset_to_use = c('dln', 'tum')
+
+for (ds in dataset_to_use){
+    if (ds=='dln'){
+        people =  dln_seurat_clust@meta.data$HTO_maxID
+        experimental = c('4', '5', '6')
+        control_label = '1-PD1-DLN'
+        experimental_label = '2-SP-DLN'
+    } else if (ds=='tum'){
+        people =  tum_seurat_clean_clust@meta.data$HTO_maxID 
+        experimental = c('10', '11', '12')
+        experimental_label = '4-SP-T'
+        control_label = '3-PD1-T'
+    } else{
+        stop(call. = 'you have wrong inputs in the dataset_to_use variable, only values accepted are : tum or dln or a vector of both')
+    }
+    grouping = NULL
+    
+    for (i in people){
+        len_i = nchar(i)
+        
+        if (len_i == 10){
+          check = substr(i, len_i-1, len_i)#strsplit(i,'')[[1]][1:2]
+        } else{
+          check = substr(i, len_i, len_i)
+        }
+        #print(check)
+        if (check %in% experimental){
+            label = experimental_label#'3-PD1-T'
+        }else{
+            label = control_label
+        }  
+        grouping = append(grouping, label)
+    }
+    if (ds=='dln'){
+        dln_seurat_clust[['label']] = grouping
+    } else if (ds=='tum'){
+        tum_seurat_clean_clust[['label']] = grouping
+    }
+}
+```
+
+
+# CODE TO APPEND MANUAL CLUSTER ANNOTATION TO DATASET 
+
+
+```{r}
+# WHICH DATASET DLN OR TUM OR BOTH ?
+dataset_to_use = c('dln', 'tum')
+
+########################################################################################################
+##################### DO NOT MODIFY UNLESS YOU WANT TO USE A DIFFERENT ANNOTATION ######################
+########################################################################################################
+dln_clust_annot_list = list(naive_t_cells= c(1,2,7),
+                            b_cells= c(0, 10, 15),
+                            cd8_t_cells = c(5, 11),
+                            macrophages = 100,
+                            monocytes = 100,
+                            Tregs = 8,
+                            Tfh = 13,
+                            GC_B_cells = c(6, 14),
+                            manual_annotation = NULL,
+                            not_immun = 100,#c(3, 4, 9)
+                            annotated_dataset_list = NULL)
+
+tum_clust_annot_list = list(naive_t_cells= 20,
+                            b_cells= 90,
+                            cd8_t_cells = c(2, 9, 13, 17),
+                            macrophages = c(0, 3, 4, 8, 11, 12, 14, 15, 21),
+                            Tregs = 100,
+                            Tfh = 100,
+                            GC_B_cells = 100,
+                            monocytes = 6,
+                            manual_annotation = NULL,
+                            not_immun = c(1, 7),
+                            annotated_dataset_list = NULL)
+
+if (isTRUEorFALSE(dataset_to_use=='dln' & length(dataset_to_use)<=1)){
+    dataset = dln_seurat_clust
+    affectation_list = dln_clust_annot_list
+} else if (isTRUEorFALSE(dataset_to_use=='tum' & length(dataset_to_use)<=1)){
+    dataset = tum_seurat_clean_clust
+    affectation_list = tum_clust_annot_list
+} else if (isTRUEorFALSE(length(dataset_to_use)>1) & 'tum'%in%dataset_to_use & 'dln'%in%dataset_to_use) {
+    dataset_vector = list(dln=dln_seurat_clust, tum=tum_seurat_clean_clust)
+    annotated_dataset_list = list()
+    not_immun_list = list(dln = 100, tum = c(1, 7))
+    affectation_list_list = list(dln=dln_clust_annot_list, tum=tum_clust_annot_list)
+} else{
+    stop(call. = 'you have wrong inputs in the dataset_to_use variable, only values accepted are : tum or dln or a vector of both')
+}
+########################################################################################################
+########################################################################################################
+
+for (ds in 1:length(dataset_to_use)){
+    if (length(dataset_to_use)>1){
+        manual_annotation = NULL
+        dataset =  dataset_vector[[ds]]
+        which_dataset = names(dataset_vector)[ds]
+        not_immun = not_immun_list[[ds]]
+        affectation = affectation_list_list[[which_dataset]]
+    } else {
+        which_dataset = dataset_to_use
+        affectation = affectation_list
+    }
+  
+    dataset_only_immun = !(dataset@meta.data$seurat_clusters%in%affectation$not_immun)
+    dataset_only_immun_cols = colnames(dataset)[dataset_only_immun]
+    dataset_only_immun_cells = WhichCells(dataset, cells = dataset_only_immun_cols)
+    dataset_only_immun_obj = subset(dataset, cells=dataset_only_immun_cols)
+    
+    for (i in dataset_only_immun_obj@meta.data$seurat_clusters){
+        if(i %in%affectation$naive_t_cells){
+          manual_annotation = append(manual_annotation, 'Naive CD4+ T cells' )
+        }else if(i%in%affectation$GC_B_cells){ #OK
+              manual_annotation = append(manual_annotation, 'GC B cells' )
+        }else if (i%in%affectation$b_cells){ #OK
+          manual_annotation = append(manual_annotation, 'B cells' )
+        }else if (i%in%affectation$Tregs){
+          manual_annotation = append(manual_annotation, 'Tregs')
+        }else if (i%in%affectation$Tfh){#OK
+          manual_annotation = append(manual_annotation, 'Tfh')
+        }else if (i%in%affectation$cd8_t_cells){
+          manual_annotation = append(manual_annotation, 'CD8+ T cells')
+        }else if (i%in%affectation$macrophages){
+          manual_annotation = append(manual_annotation, 'Macrophages')
+        }else if (i%in%affectation$monocytes){
+          manual_annotation = append(manual_annotation, 'Monocytes')
+        }else {
+          if (which_dataset =='dln' ){
+              manual_annotation = append(manual_annotation,'Myeloid cells')
+          } else {
+                manual_annotation = append(manual_annotation,'No annotation')
+          }
+        }
+    }
+    dataset_only_immun_obj = AddMetaData(object = dataset_only_immun_obj, 
+                                         metadata =  manual_annotation, col.name=c('manual_annotation'))
+    
+    if (length(dataset_to_use)>1){
+        annotated_dataset_list = append(annotated_dataset_list, dataset_only_immun_obj)
+    }
+}
+names(annotated_dataset_list) = dataset_to_use
+```
+
+
+# Code to generate UMAP/t-SNE projections (by groups and cell)
+
+
+```{r}
+
+orig = '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/'
+folders = c('dln', 'tum')
+techniques = c('tsne', 'umap')
+visualizations = c('label', 'manual_annotation')
+
+for (folder in folders){
+  out_path = orig
+
+  if (folder=='dln'){
+      out_path_1 = paste0(out_path, 'cell_type_wise/paper_grade_figures/projection/dln_')
+  } else {
+      out_path_1 = paste0(out_path, 'cell_type_wise_tum/paper_grade_figures/projection/tum_')
+  }
+  if (!is.null(annotated_dataset_list)){
+      for (dataset in names(annotated_dataset_list)){
+             if (dataset==folder){
+                dataset_only_immun_obj = annotated_dataset_list[[dataset]]
+                break
+             }
+      }
+  }
+  for (technique in techniques){
+      out_path_2 = paste0(out_path_1, technique)
+      
+      for (visualization in visualizations){
+        out_path_3 = paste0(out_path_2, '_', visualization, '.png')
+        
+        if (visualization=='label'){
+          cols = c('red', 'blue')
+          DimPlot(dataset_only_immun_obj , group.by = visualization, reduction = technique, cols = cols)
+        } else if (visualization=='manual_annotation'){
+          DimPlot(dataset_only_immun_obj , group.by = visualization, reduction = technique)
+        }
+        #scale_color_manual(name = "Categories", breaks = c("a-PD1-S","a-PD1"), values=c("red", "blue"))
+        ggsave(out_path_3, width = 7, height = 7, device='tiff', dpi=700)
+      }
+  }
+}
+```
+
+
+# QC metrics violin plots
+
+
+```{r}
+feats <- c("nFeature_RNA", "nCount_RNA", "percent_mito", "percent_ribo")
+ VlnPlot(dataset_only_immun_obj, features = feats, pt.size = 0, ncol = 4, group.by = 'manual_annotation') + NoLegend()
+```
+
+
+# SLIDE FIRST ROUND (all data)
+
+
+```{r}
+################################################################################
+########## KEEPING HIGH VARIANCE TUMOR X
+################################################################################
+df_x = tum_seurat_clean_clust@assays$RNA[,]
+# to get the variance you apply with axis = 2 (columns)
+col_variance = apply(df_x, 2, var)
+#do the same for CV
+means = apply(X=df_x, FUN=mean, MARGIN=2)
+coef = (sqrt(col_variance)/means)*100
+# to filter the columns based on being in a certain quantile
+col_high_variance = unique(which(coef< quantile(coef,prob=0.75) & col_variance > quantile(col_variance, prob=0.25)))
+# to get the variance you apply with axis = 2 (columns)
+row_variance = apply(df_x, 1, var)
+#do the same for CV
+row_means = apply(X=df_x, FUN=mean, MARGIN=1)
+coef_rows = (sqrt(row_variance)/row_means)*100
+#rows high var
+rows_high_variance = unique(which(coef_rows< quantile(coef,prob=0.75) & row_variance > quantile(row_variance, prob=0.25)))
+
+uniq_names_dln = rownames(tum_seurat_clean_clust)[rows_high_variance]
+df_x = df_x[rows_high_variance, col_high_variance]
+
+df_x = t(df_x) 
+rownames(df_x) = colnames(tum_seurat_clean_clust)[col_high_variance]
+colnames(df_x) = rownames(tum_seurat_clean_clust)[rows_high_variance]
+
+rownames_df_x = data.frame(colnames(tum_seurat_clean_clust)[col_high_variance])
+colnames(rownames_df_x) = c('cells')
+df_x  = cbind(rownames_df_x, df_x)
+
+write.csv(df_x, '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/Tumor/tum_ER_X.csv', row.names=FALSE)
+```
+
+```{r}
+################################################################################
+########## KEEPING HIGH VARIANCE TUMOR Y
+################################################################################
+
+str_label = tum_seurat_clean_clust@meta.data$label[col_high_variance]
+
+PD1_T_ind = which(str_label=="3-PD1-T")
+SP_T_ind = which(str_label=="4-SP-T")
+
+str_label[PD1_T_ind] = 1
+str_label[SP_T_ind] = 0
+df_tum_y = data.frame(str_label)
+
+uniq_names_tum_y = colnames(tum_seurat_clean_clust)[col_high_variance]
+cells_df_tum = data.frame(uniq_names_tum_y)
+colnames(cells_df_tum) = c('Labels')
+rownames(cells_df_tum) = uniq_names_tum_y
+df_tum_y = cbind(cells_df_tum, df_tum_y)
+
+write.csv(df_tum_y, '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/Tumor/tum_ER_y.csv', row.names=FALSE)
+```
+
+
+# CODE TO GENERATE SLIDE INPUT FOR EACH CELL TYPE
+
+
+```{r}
+################################################################################
+########## KEEPING HIGH VARIANCE DLN X 
+################################################################################
+
+
+################ CHECK THESE ################ ################ ################ 
+# DATA SET CELL TYPES
+cell_types = dataset_only_immun_obj@meta.data$manual_annotation %>% unique()
+# WHICH CLUSTER (ANNOTATED) DO YOU WANT TO IGNORE, IF CONSIDERING ALL JUST PUT NULL ?
+to_skip = 'No annotation' 
+## WHERE SHOULD THE INPUT FOLDER BE CREATED
+output_dir = '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/cell_type_wise_tum'
+################ ################ ################ ################ ################ 
+
+
+################ LEAVE THIS UNTOUCHED ################ ################ 
+## GROUP LABELS
+control_group =  "3-PD1-T"
+experimental_group = "4-SP-T"
+# INPUT FILES EXTENSIONS
+X_file_suffix_and_extension = 'tum_only_immune_ER_X.csv'
+y_file_suffix_and_extension = 'tum_only_immune_ER_y.csv'
+
+count = 0
+################ ################ ################ ################ 
+
+for (i in cell_types){
+
+    if  (i==to_skip){
+      next
+    } #else if (i=="Naive CD4+ T cells"){
+      #prob_coef = 0.9
+      #prob_var = 0.1
+     # next
+   # } 
+    
+    cells_to_pick = which(dataset_only_immun_obj@meta.data$manual_annotation==i)
+    df_x_dln = data.frame(dataset_only_immun_obj@assays$RNA[,cells_to_pick])
+    # to get the cells variance you apply with axis = 2 (columns)
+    #col_variance = apply(df_x_dln, 2, var)
+    # to filter the columns based on being in a certain quantile
+    #means = apply(X=df_x_dln, FUN=mean, MARGIN=2)
+    #do the same for CV
+    #coef = (sqrt(col_variance)/means)*100
+    # to filter the columns based on being in a certain quantile
+    #if (i!="Naive CD4+ T cells"){
+    #  col_high_variance = unique(which(coef< quantile(coef,prob=prob_coef) & col_variance > quantile(col_variance, prob=prob_var)))
+    #}else{
+    #  col_high_variance = 1:dim(df_x_dln)[2]
+    #}
+    # to get the gene variance you apply with axis = 1 (rows)
+    row_variance = apply(df_x_dln, 1, var)
+    #do the same for CV
+    row_means = apply(X=df_x_dln, FUN=mean, MARGIN=1)
+    coef_rows = (sqrt(row_variance)/row_means)*100
+    #rows high var
+    rows_high_variance = unique(which(coef_rows< quantile(coef_rows,prob=0.75, na.rm=TRUE) & row_variance > quantile(row_variance, prob=0.75)))
+    
+    uniq_names_dln = rownames(dataset_only_immun_obj)[rows_high_variance]
+    df_x_dln = df_x_dln[rows_high_variance, ]#col_high_variance]
+    
+    df_x_dln = t(df_x_dln) 
+    rownames(df_x_dln) = colnames(dataset_only_immun_obj)[cells_to_pick]#col_high_variance]#
+    colnames(df_x_dln) = rownames(dataset_only_immun_obj)[rows_high_variance]
+    
+    #rownames_df_x_dln = data.frame(colnames(dataset_only_immun_obj)[cells_to_pick])#[col_high_variance])
+    #colnames(rownames_df_x_dln) = c('cells')
+    #df_x_dln  = cbind(rownames_df_x_dln, df_x_dln)
+    #df_x_dln = as.data.frame(df_x_dln)
+    
+    file = str_replace_all(i, ' ', '_')
+    file = str_replace_all(file, '[+]', '')
+    mkdir = paste0('mkdir ', output_dir, '/', file)
+    system(mkdir)
+    write.csv(df_x_dln, paste0(output_dir, '/', file, '/', file, '_', X_file_suffix_and_extension), row.names = T)
+    
+    #label_to_pick = intersect(col_high_variance, cells_to_pick)
+    cells_to_use = which(colnames(dataset_only_immun_obj)%in%rownames(df_x_dln))
+    str_label = dataset_only_immun_obj@meta.data$label[cells_to_use]
+    
+    control_group_ind = which(str_label==control_group)
+    experimental_group_ind = which(str_label==experimental_group)
+    
+    str_label[control_group_ind] = 0
+    str_label[experimental_group_ind] = 1
+    df_dln_y = data.frame(str_label)
+    
+    #cluster_lab = rep(i, length(col_high_variance))#col_variance))
+      
+    #if (count==0){
+    #  to_plot_control = cbind(as.numeric(col_variance), as.factor(str_label), cluster_lab) %>% as.data.frame()
+    #  colnames(to_plot_control) = c('Genes_variance', 'Group', 'Cell_type')
+    #  count = count + 1
+    #}else{
+    #  to_bind = cbind(as.numeric(col_variance), as.factor(str_label), cluster_lab) %>% as.data.frame()
+    #  colnames(to_bind) = c('Genes_variance', 'Group', 'Cell_type')
+    #  to_plot_control = rbind(to_plot_control, to_bind) 
+    #}
+    
+    uniq_names_dln_y = colnames(dataset_only_immun_obj)[cells_to_use]
+    cells_df_dln = data.frame(uniq_names_dln_y)
+    colnames(cells_df_dln) = c('Labels')
+    rownames(df_dln_y) = cells_df_dln$Labels
+    #rownames(cells_df_dln) = uniq_names_dln_y
+    #df_dln_y = cbind(cells_df_dln, df_dln_y)
+    
+    write.csv(df_dln_y, paste0(output_dir, '/', file, '/', file, '_', y_file_suffix_and_extension), row.names = T)
+}
+#write.csv(to_plot_control, paste0('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/dln_only_immune_var.csv'))
+#ggplot(data = to_plot_control)+geom_violin(aes(y=Genes_variance, x=factor(Group), group=Cell_type, fill=factor(Group)), draw_quantiles = c(0.25, 0.5, 0.75))
+```
+
+```{r}
+################################################################################
+########## KEEPING HIGH VARIANCE DLN Y
+################################################################################
+
+str_label = dataset_only_immun_obj@meta.data$label[col_high_variance]
+
+control_group_ind = which(str_label=="1-PD1-LN")
+experimental_group_ind = which(str_label=="2-SP-LN")
+
+str_label[control_group_ind] = 0
+str_label[experimental_group_ind] = 1
+df_dln_y = data.frame(str_label)
+
+uniq_names_dln_y = colnames(dataset_only_immun_obj)[col_high_variance]
+cells_df_dln = data.frame(uniq_names_dln_y)
+colnames(cells_df_dln) = c('Labels')
+rownames(cells_df_dln) = uniq_names_dln_y
+df_dln_y = cbind(cells_df_dln, df_dln_y)
+
+
+write_csv(df_dln_y, '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/dln_only_immune_ER_y.csv')
+```
+
+
+#  Code to check slide input files, WE HIGHLY RECOMMEND RUNNING THIS CHUNCK BEFORE SUBMITING DATA TO SLIDE
+
+```{r}
+################################################################################
+########## CHECK SLIDE INPUT FILES
+################################################################################
+
+path_dirs_to_check = '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/cell_type_wise_tum'
+yaml_path =  file.path(path_dirs_to_check, 'final_tum.yaml')
+dirs = list.dirs(path_dirs_to_check, recursive = F)
+csv_file_pattern = 'tum_only_immune_ER'
+
+for (i in dirs[1:length(dirs)]){
+    if (dir.exists(i)){
+        files = list.files(i)
+        ind_csv = stringr::str_detect(files, csv_file_pattern)
+        files = files[ind_csv]
+        print(files)
+        #x_file = which(str_detect(files, 'X.csv')==TRUE)
+        #y_file = which(str_detect(files, 'y.csv')==TRUE)
+        #x_path = file.path(i, files[x_file])
+       # y_path = file.path(i, files[y_file])
+        yaml_file = yaml::read_yaml(yaml_path)
+        yaml_file$x_path = file.path(i, files[1])
+        yaml_file$out_path = i
+        yaml_file$y_path = file.path(i, files[2])
+        yaml::write_yaml(x = yaml_file, file = yaml_path)
+        SLIDE::checkDataParams(yaml_path)
+      ##  SLIDEHelper::CheckDataParams(yaml_path = yaml_path, x_path = x_path, 
+                                  #   y_path = y_path, pipeline = 3)
+    }
+}
+```
+
+
+```{r}
+length(which(tum_seurat_clean_clust@assays$RNA['Cd4',]>1))/length(tum_seurat_clean_clust@assays$RNA['Cd4',])
+RidgePlot(tum_seurat_clean_clust, features = c('Cd4', 'Sell'), ncol = 2)
+```
+
+
+# Legacy code for running SLIDE, WE HIGHLY RECOMMEND USING THE PROVIDED SCRIPT INSTEAD
+
+```{r}
+################################################################################
+########## SLIDE RUN AND ANALYSIS
+################################################################################
+cells_folder = 'all_cell_types'#_delta_0_0_5'
+cells_files = 'tum'
+path_tum = '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/Tumor_V2/'
+path_dln = '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/cell_type_wise/'
+dln_csv_extension = '_dln_only_immune_ER_X.csv'
+tum_csv_extension = '_ER_X.csv'
+#cells_2 = 'B_cells'
+x_path = paste0(path_tum, cells_folder,'/', cells_files,tum_csv_extension)#cells_2,'_dln_only_immune_ER_X.csv')cells,
+y_path = paste0(path_tum, cells_folder,'/', cells_files,tum_csv_extension)#cells_2,'_dln_only_immune_ER_y.csv')
+er_path = paste0(path_tum, cells_folder,'/ER_resultfinal_delta_0.1_lambda_1.rds')
+out_path = paste0(path_tum, cells_folder,'/slide_0_4')
+
+#slide_res = readRDS('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/ER_result_ZAK_dln/slide_res.RDS')
+#x_path = paste0('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/ER_result_ZAK_tum/tum_ER_X.csv')
+#y_path = paste0('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/ER_result_ZAK_tum/tum_ER_y.csv')
+#er_path = paste0('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/ER_result_ZAK_tum/final_delta_0.1_lambda_1.rds')
+#out_path = paste0('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/ER_result_ZAK_tum/slide_spec_0_25/')
+
+z_mat = SLIDEHelper::CalcZMatrix(x_path = x_path, er_path = er_path, 
+                                 out_path = paste0(out_path,'/slide_0_4_'))
+z_path = file.path(out_path, 'slide_0_4_z_matrix.csv')
+slide_res = SLIDEHelper::runSLIDE(y_path = y_path, z_matrix = z_mat, 
+                                  er_path = er_path, do_interacts=T, niter=3000, spec = 0.4)
+saveRDS(slide_res, paste0(out_path, '/slide_res_0_2.RDS'))
+SLIDE_res <- SLIDEHelper::GetTopFeatures(x_path=x_path, y_path=y_path, 
+                                         er_path=er_path, out_path=out_path, SLIDE_res = slide_res, num_top_feats = 20, condition='auc'-)
+
+SLIDEHelper::plotSigGenes(SLIDE_res, out_path, plot_interactions=T)#, annotate_anchors = TRUE)
+
+#z_mat = read.csv(z_path)
+y_path_control_plot = paste0(out_path,'/y_control_plot_spec_0_85.csv')
+
+#Stand alone indices
+SLIDE_res$marginal_vals
+#Interaction indices
+SLIDE_res$SLIDE_res$interaction_vars
+
+slide_res_path = '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/cell_type_wise/Myeloid_cells_delta_0_5/slide_0_4/SLIDE_res_0_4.RDS'
+
+SLIDE_res = readRDS(slide_res_path)
+z_mat = read.csv(paste0(out_path,'/slide_0_4_z_matrix.csv'),row.names = 1)
+
+withCallingHandlers(SLIDEHelper::CalcControlPerformance(z_matrix = z_mat, y_path=y_path,
+                                           SLIDE_res=SLIDE_res, niter = 1000, condition='auc', 
+                                           out_path=y_path_control_plot),
+                      error = function(e) {
+                        print(sys.calls())
+                      })
+#corrplot::corrplot(cor(z_mat), ylab = 'LF', xlab = 'LF',title = '\nCorrelation matrix of Z matrix', addCoef.col = 'black',diag = FALSE, type = 'upper')
+```
+
+
+# Code to generate scatter plots for SLIDE LFs
+
+
+```{r}
+library(RColorBrewer)
+
+orig = '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/cell_type_wise_tum/'
+cells = c('CD8_T_cells', 'Naive_CD4_T_cells')
+#same order as cells, ORDER MATTERS
+z_mat_names_vector = c('z_matrix.csv',  'z_matrix.csv')
+#latent factors to use for each cell type
+z_tocheck_vector = list(c('Z23', 'Z28', 'Z37'), c('Z156', 'Z283', 'Z380', 'Z565'))
+# counter
+cell_type_ind = 1
+#used to retrieve the label vector
+y_csv_suffix = '_tum_only_immune_ER_y.csv'
+
+#Category = tum_seurat_clean_clust@meta.data$label
+  # dln_seurat_only_immun_obj@meta.data$label[which(dln_seurat_only_immun_obj@meta.data$manual_annotation==cells)]#[col_high_varianc]
+for (i in list.dirs(orig, full.names = F, recursive = F)){
+    if (!(i%in%cells)){
+      next
+    } else if (!(is.null(z_mat_names_vector==NULL))){
+      z_mat_file_name = z_mat_names_vector[cell_type_ind]
+    } else {
+      stop('PLEASE PROVIDE NAMES OF THE Z MATRICES YOU WOULD LIKE TO USE')
+    }
+    #if (i=='Tfh_cells'){
+    z_path= paste0(orig, i, '/', z_mat_file_name)
+      #z_to_check = c('Z105','Z106')
+   # }else{
+     # z_path= paste0(orig, i, '/Tregsz_matrix.csv')
+      #z_to_check = c('Z102', 'Z53')
+   # }
+
+    test = stringr::str_detect(i, '_delta')
+    
+    if(test){
+        dataset_prefix_ind = stringr::str_locate(i, '_delta')
+        dataset_prefix = stringr::str_sub(i, start = 1, end = dataset_prefix_ind[1]-1)
+    } else{
+      dataset_prefix = i
+    }
+  
+    y_path = paste0(orig, i, '/', dataset_prefix, y_csv_suffix)
+    print('y')
+    print(y_path)
+    Category = read.csv(y_path, row.names = 1)
+    z_mat = read.csv(z_path, row.names = 1)
+    print('Z')
+    print(z_path)
+    Category[,1] = Category[,1] %>% as.factor()
+    print('unique category')
+    print(unique(Category[,1]))
+    ok = as.data.frame(z_mat) %>% cbind(Category)
+   # Zs = colnames(ok)
+    #all = Zs %>% length() - 1
+   # Zs = str_extract(Zs[2:all], as.character(2:13)) %>% as.numeric()
+   count = 2
+   z_to_check = z_tocheck_vector[[cell_type_ind]]
+   cell_type_ind = cell_type_ind + 1
+   ok$str_label = if_else(ok$str_label==0, "a-PD1","a-PD1-S")
+   #print('here 1')
+   
+   for (LF1 in z_to_check){
+    # print('here 2')
+     if(count>length(z_to_check)){
+       break
+     }
+     #print('here')
+     for (LF2 in z_to_check[count:length(z_to_check)]){
+       out_path = paste0(orig, 'paper_grade_figures', '/', i, '/', LF1, '_', LF2, '.png')
+       #print(out_path)
+       #ok$str_label = if_else(ok$str_label==0, "a-PD1","a-PD1-S")
+       print('category after if else')
+       print(unique(ok$str_label))
+       ggplot2::ggplot(data = ok)+
+         geom_point(data = ok, aes(x=ok[,LF1], y=ok[,LF2], color=ok[,'str_label']),
+                    size = 0.8, group = 2, show.legend = T, inherit.aes=F)+
+         scale_color_manual(name = "Categories",breaks = c("a-PD1-S","a-PD1"),
+                            values=c("red", "blue"))+
+         labs(title = paste0("Projection of ", dataset_prefix, " from draining lymph node in LFs space"))+#theme_gray()+#,
+         theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+ theme_classic()+ 
+         scale_fill_manual("Categories",values=c("blue","red"))+xlab(LF1)+ylab(LF2)#+
+       # theme(legend.position="none")
+       #guides(color = guide_legend(title = "Categories")) +scale_color_manual(breaks = c("0","1"),
+       #values=c("red", "blue")) + theme(legend.position="none")
+       #scale_fill_discrete(name = "Categories")
+       #guides(fill=guide_legend(title="New Legend Title"))
+       ggsave(out_path, width = 7, height = 7, device='tiff', dpi=700)
+     }
+     count = count + 1
+   }
+}
+#grid.arrange(scatter,(scatter +scale_colour_Publication()+ theme_Publication()),nrow=1)
+```
+
+
+# Code to calculate Cliff's Delta for SLIDE LFs
+
+
+```{r}
+
+Calc_Cliff_Delta <- function(sig_z, y){
+  all_cds <- data.frame()
+  # box plot, no abs(), no gridline/ no background. rename x and ys.
+  for (i in 1:dim(sig_z)[[2]]){
+    col <- sig_z[ , i]
+    df1 <- as.data.frame(col)
+    df1['stages'] <- y[, 2]
+    p <- ggplot(df1, aes(x=factor(stages), y=col)) + geom_boxplot(aes(fill = factor(stages))) + scale_fill_brewer(palette="Dark2") + ggtitle(as.character(i)) + ylim(-2, 2) +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+            panel.background = element_blank(), axis.line = element_line(colour = "black"))
+    print(p)
+    comb <- list(c(0, 1))#colnames(sig_z)#combn(colnames(sig_z), 2) #list(c(0, 1), c(1, 2), c(0, 2))
+    idx <- rep(i, length(comb))
+    b1 <- c()
+    b2 <- c()
+    deltas <- c()
+    
+    for (j in 1){
+      s <- comb[[j]]
+      print(s)
+      b1 <- append(b1, s[1])
+      b2 <- append(b2, s[2])
+      #print(b1)
+      #print(df1[df1['stages']==s[1], ]$col)
+      res = cliff.delta(df1[df1['stages']==s[1], ]$col, df1[df1['stages']==s[2], ]$col, return.dm=TRUE)
+      deltas <- append(deltas, res$estimate)
+    }
+    tmp_df <- do.call(rbind.data.frame, Map("c", idx, b1, b2, deltas))
+    colnames(tmp_df) <- c("n_col", "b1", "b2", "deltas")
+    all_cds <- rbind(all_cds, tmp_df)
+  }
+  return(all_cds)
+}
+#slide_res =readRDS('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/ER_result_ZAK_tum/slide_res.RDS')
+#z_mat = read.csv('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/ER_result_ZAK_tum/z_matrix.csv', row.names = 1)
+y = read.csv(y_path)
+marginals = SLIDE_res$marginal_vals
+interactions = SLIDE_res$interaction$p2#which(colnames(slide_res$interaction_vals)==slide_res$interaction_vars)#unique(slide_res$interaction_vars)#slide_res$interaction$p2)
+both = c(marginals, interactions)
+both = sort(both) %>% unique()
+#sig = c(7,13,39,46,47,51,52,65,69,85,89,94,98,101)
+z_mat_to_use = z_mat[,both]#z_mat[,sig]
+cliffs_delta = Calc_Cliff_Delta(z_mat_to_use, y) #z_mat[,both]
+```
+
+
+# Code to plot Cliff's Delta as a bar plot
+
+
+```{r}
+x = paste0(c('Z'), as.character(both)) # sig))3
+cliffs_delta['LF'] = x
+cliffs_delta[,1:4] = abs(cliffs_delta[,1:4])
+ggplot2::ggplot()+geom_bar(data=cliffs_delta,aes(x=LF,y=deltas),stat='identity', show.legend = T, inherit.aes=T)+
+    labs(title = "Barplot of absolute value of Cliff's delta for each LF")+theme_gray()+#,
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+
+# Code to show proportion of cell types per cluster (only relevant if heterogeneous cluster composition)
+
+
+```{r}
+dittoBarPlot(dataset_only_immun_obj, 
+             var = 'manual_annotation', group.by = "seurat_clusters")
+```
+
+
+# Violin plots of cell type markers per cluster
+
+
+```{r}
+# classical monocytes 
+VlnPlot(dln_seurat_clust, features = c('Ly6c1', 'Spn', 'Itgam', 'Csf1r', 'Sell'), pt.size = 0)
+# CD4
+VlnPlot(tum_seurat_clean_clust, features=c('Cd4', 'Il2ra', 'Sell', 'Cd44', 'Cd3e', 'Cd3d', 'Cd8a'), log = TRUE, pt.size = 0)
+#CD8
+VlnPlot(tum_seurat_clean_clust, features=c('Cd28', 'Stat6', 'Batf', 'Cd5', 'Cd3e', 'Cd27', 'Cd8a','Stat6','Bcl6','Prdm1'), log = TRUE, pt.size = 0)
+# Tregs
+VlnPlot(tum_seurat_clean_clust, features=c('Cd44', 'Il2ra', 'Ptprc', 'Il7r', 'Cd4', 'Sell'), log = TRUE, pt.size = 0)
+# Tfh
+VlnPlot(tum_seurat_clean_clust, features=c('Cd44', 'Gata3', 'Batf', 'Cd3e', 'Cd4', 'Stat6', 'Prdm1','Bcl6'), log = TRUE, pt.size = 0)
+# B cells
+VlnPlot(tum_seurat_clean_clust, features=c('Cd9', 'Cd27', 'Cd24a', 'Cd38', 'Cd40', 'Fas', 'Sdc1','Cxcr4', 'Cd20', 'Cd23', 'Cd150'), log = TRUE, pt.size = 0)
+# NK cells
+VlnPlot(tum_seurat_clean_clust, features=c('Il2rb', 'Cd27', 'Il7r', 'Cd244a', 'Klrk1', 'Klrc1', 'Spn', 'Sell', 'Cd226', 'Ncr1', 'Cd150'), log = TRUE, pt.size = 0)
+#Macrophages
+VlnPlot(tum_seurat_clean_clust, features = c('Cd14', 'Fcgr3', 'Fcgr2b', 'Fcgr1', 'Cd68', 'Cd80', 'Cd86', 'Msr1', 'Clec7a', 'Ly6c1', 'Mertk', 'Irf5', 'Itgam', ), pt.size = 0)
+#monocytes
+VlnPlot(tum_seurat_clean_clust, features = c('Ly6c1', 'Spn', 'Itgam', 'Csf1r', 'Sell', 'Ccr2', 'Cx3cr1'), log = TRUE, pt.size = 0)
+```
+
+
+# Code to generate LF correlation networks part 1
+
+
+```{r}
+create_corr_network = function(x, y, out_dir, plot_name, gene_names, groups, corr_threshold){
+
+  # x - sample x feature matrix
+  # y - labels (assuming binary)
+  # out_dir - where you want the plot saved
+  # plot_name - title for plot
+  # gene_names - vector with sig genes you want to select
+  setwd(out_dir)
+  count = 0
+  
+  if (groups){
+    groups = list()
+  } else{
+    groups = NULL
+  }
+  
+  for (i in names(gene_names)){
+      indx = gene_names[[i]]
+      
+      if (count){
+        x_gene = cbind(x_gene, as.matrix(x[, indx]))#gene_names])
+        start = end + 1
+      }else{
+        x_gene = as.matrix(x[, indx])
+        start = 1
+        #count = count + 1
+      }
+      count = count + 1
+      group_len = indx %>% length() 
+      end = start + group_len
+      range = start:end
+      groups = append(groups, range)    
+  }
+  # uncomment if you want the nodes colored by AUC
+  print('nik mok')
+  print(gene_names)
+  print(sum(gene_names%in%x))
+  x_gene = x[,gene_names]
+  print('nahtchoun yemak')
+  col_auc = round(apply(x_gene, 2, function(xs) glmnet:::auc(as.matrix(y), as.matrix(xs))), 2)
+  positive_corr_text = 'Higher in a-PD1'
+  negative_corr_text = 'Higher in a-PD1+S'
+  no_corr_text = 'No association'
+  
+  #col_auc = round(apply(x_gene, 2, function(xs) cor(as.matrix(y), as.matrix(xs))), 2)
+  #col_auc = round(apply(x_gene, 2, function(xs) cor(as.matrix(y), as.matrix(xs))), 2)
+  temp_cols = NULL
+  temp_cols = ifelse(col_auc > 0.55, "red", ifelse(col_auc < 0.45, "blue","lightgray"))
+  groups = to_vec(for(x in temp_cols) if (x=='red') positive_corr_text else if (x=="blue") negative_corr_text else no_corr_text)
+  #to_list(for (x in groups) if (x==positive_corr_text) positive_corr_text = )
+  which_positive = which(groups == positive_corr_text)
+  which_negative = which(groups == negative_corr_text)
+  which_no = which(groups == no_corr_text)
+  groups_list = list('Higher in a-PD1'=which_positive, 
+                     'Higher in a-PD1+S'=which_negative, 
+                     'No association'=which_no)
+  x_temp = cor(x_gene)
+  #print('gene_names') 
+  #print(length(gene_names))
+  #print('groups')
+  #print(length(groups))
+  #print(typeof(groups))
+  #print(groups)
+  plot_name = paste0(plot_name, "\nCorrelations threshold = ",
+                     corr_threshold, '\n\n\n')
+ # print('temp_cols')
+  #print(temp_cols)
+  
+  pl = qgraph(x_temp, filename= plot_name,
+               threshold=corr_threshold, repulsion=0.3,
+              labels = colnames(x_temp),
+              color = temp_cols, # uncomment if you want the nodes colored by AUC
+              title = plot_name,
+              label.scale.equal=FALSE,label.prop=0.95,shape="ellipse",
+              posCol="green",negCol="black",filetype='pdf',height=7,
+              width=7,  legend = F, borders = T, vTrans = 200,color='white', 
+              graph = "cor", groups=groups_list, layout = "spring", legend.mode="groups")
+  print(plot_name)
+  #, nodeNames = unique(groups))
+              #title("Correlations threshold for edge formation = 0.15", line = 2.5)
+}
+```
+
+
+# Code to generate LF correlation networks part 2
+
+
+```{r}
+#https://cran.r-project.org/web/packages/qgraph/index.html
+auto_corr_net = function(x, y, out_dir, groups, top_nfeatures, corr_threshold){
+    gene_names_groups = NULL
+    group = list()
+    plot_name = 'Correlation network'
+    count = 0
+    
+    for (i in list.files(out_dir)){
+       if (stringr::str_detect(string = i, pattern = 'gene_list_Z')){
+         if (nchar(i)>16){
+           Z_corr = stringr::str_sub(string = i, start = 11, end=13)
+         }
+         else if(nchar(i)==16){
+           Z_corr = stringr::str_sub(string = i, start = 11, end=12)
+         }
+         else{
+           Z_corr = stringr::str_sub(string = i, start = 11, end=14)
+         }
+         
+         file_dir = file.path(out_dir, i)
+         print(file_dir)
+         gene_list = read.delim(file_dir)
+         gene_names = gene_list$names[1:top_nfeatures]
+         gene_names = gene_names[!is.na(gene_names)]
+         gene_names = gene_names[which(gene_names!='Gm42418' & gene_names!='Lars2')]
+         
+         if(!groups){
+            plot_name_Z = paste0(plot_name, ' ', Z_corr)
+            create_corr_network(x, y, out_dir, plot_name_Z, gene_names, group=F,
+                                corr_threshold = corr_threshold) 
+         }else{
+            gene_names_groups = append(gene_names_groups, gene_names)
+           #= append(gene_names_groups, gene_names)
+            #group_len = length(gene_names)
+            
+            #if (!count){
+            #  start = 1
+              #count = count + 1
+            #}else{
+            #  start = end + 1
+           # }
+           # count = count + 1
+            #end = start + group_len
+            range = which(colnames(x)%in%gene_names)#start:end
+            #range_list = list()
+            #range_list[[Z_corr]] = range
+            #names(range) = rep(Z_corr, group_len)
+            group[[Z_corr]]= range
+          }
+       }        #print(Z_corr)
+    }
+    if (groups){
+          #print(gene_names_groups)
+        
+        create_corr_network(x = x, y = y, out_dir = out_dir, 
+                            plot_name = plot_name,
+                            gene_names = gene_names_groups, group=T, 
+                            corr_threshold = corr_threshold)
+    }
+}
+
+orig = '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/cell_type_wise_tum'
+top_nfeatures = 12
+cells = c('CD8_T_cells', 'Naive_CD4_T_cells')
+
+folder = 'tum'
+x_suffix = paste0('_', folder,'_only_immune_ER_X.csv')
+y_suffix = paste0('_', folder,'_only_immune_ER_y.csv')
+
+for (i in list.dirs(orig, full.names = F, recursive = F)){
+    test = stringr::str_detect(i, '_delta')
+    
+    if ((i%in%cells)){#Naive_
+      print(i)
+      if(test){
+          dataset_prefix_ind = stringr::str_locate(i, '_delta')
+          dataset_prefix = stringr::str_sub(i, start = 1, end = dataset_prefix_ind[1]-1)
+      } else{
+        dataset_prefix = i
+      }
+      
+      x_path = file.path(orig , i, paste0(dataset_prefix, x_suffix))
+      y_path = file.path(orig , i, paste0(dataset_prefix, y_suffix))
+      x = read.csv(x_path, header = T, row.names = 1)
+      y = read.csv(y_path)
+      #out_dir = file.path(orig , 'paper_grade_figures' , i)
+      
+      if(folder=='dln'){
+        if (i == 'Tfh_cells' | i=='Tregs'){
+           out_dir  = file.path(orig , i)
+        } else if (i=='CD8_T_cells_delta_0_5'){
+            out_dir  = file.path(orig , i, 'slide_0_15')
+        } else {
+            out_dir  = file.path(orig , i, 'slide_0_5')
+        }
+      } else if (folder=='tum'){
+          if (i=='Naive_CD4_T_cells'){
+             out_dir = file.path(orig , i, '0.1_1_out')
+          } else{
+             out_dir = file.path(orig , i)
+          }
+      }
+      auto_corr_net(x=x, y=y[,2], out_dir=out_dir, top_nfeatures = top_nfeatures,
+                     groups=F, corr_threshold=0.1)
+  }
+}
+
+```
+
+
+# Code to generate SLIDE boxplots
+
+
+```{r}
+
+orig = '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/cell_type_wise_tum'
+top_nfeatures = 12
+cells = c('Naive_CD4_T_cells', 'CD8_T_cells')
+folder = 'tum'
+eval_type = 'auc'
+x_suffix = '_tum_only_immune_ER_X.csv'
+y_suffix = '_tum_only_immune_ER_y.csv'
+    
+for (i in list.dirs(orig, full.names = F, recursive = F)){
+    test = stringr::str_detect(i, '_delta')
+    
+    if ((i%in%cells)){
+        print(i)
+      
+        if(test){
+            dataset_prefix_ind = stringr::str_locate(i, '_delta')
+            dataset_prefix = stringr::str_sub(i, start = 1, end = dataset_prefix_ind[1]-1)
+        } else{
+          dataset_prefix = i
+        }
+    
+        out_path_1 = file.path(orig, dataset_prefix)
+        x = as.matrix(utils::read.csv(file.path(out_path_1, paste0(dataset_prefix, x_suffix))
+                                      , row.names = 1))
+        y = as.matrix(utils::read.csv(file.path(out_path_1, paste0(dataset_prefix, y_suffix))
+                                      , row.names = 1))
+    
+            if(folder=='dln'){
+                if (i == 'Tfh_cells' | i=='Tregs'){
+                   where_results  = file.path(orig , i)
+                } else {
+                    where_results  = file.path(orig , i, 'slide_CV')
+                }
+            } else if (folder=='tum'){
+                  where_results  = file.path(orig , i)
+            }
+        #file.path(orig , i)
+        pathLists <- list.files(where_results, recursive = T, pattern = "results")
+        #file.path(orig , i, pathLists)
+        perfList <- lapply(file.path(where_results, pathLists), readRDS)
+        perRes <- do.call(rbind, lapply(perfList, function(x){x$final_corr}))
+        perRes$method = if_else(perRes$method=='SLIDE', "Actual", "Permuted")
+        
+        if (eval_type == "corr") {
+          lambda_boxplot <- ggplot2::ggplot(data = perRes,
+                                            ggplot2::aes(x = method, y = corr,
+                                                         fill = method)) +
+            ggplot2::geom_boxplot() +
+            ggplot2::scale_fill_manual("method", values=c("green","grey"))+
+            ggplot2::labs(fill = "Method") +
+            ggplot2::scale_alpha(guide = 'none') 
+          
+          lambda_boxplot = lambda_boxplot + theme_classic()
+        } else {
+          lambda_boxplot <- ggplot2::ggplot(data = perRes,
+                                            ggplot2::aes(x = method, y = auc,
+                                                         fill = method)) +
+            ggplot2::geom_boxplot() +
+            ggplot2::scale_fill_manual("method", values=c("green","grey"))
+            ggplot2::labs(fill = "Method") +
+            ggplot2::scale_alpha(guide = 'none')
+            
+            lambda_boxplot = lambda_boxplot + theme_classic()
+        }
+        
+        ggsave(paste0(file.path(orig , i),"/delta", 0.1,"lambda", 1,"_boxplot.pdf"),lambda_boxplot)
+        print(file.path(orig , i))
+    }
+}
+#saveRDS(perRes,file=paste0(out_path ,"/delta", 0.05,"lambda", 1,"_boxplot_data.rds"))
+```
+

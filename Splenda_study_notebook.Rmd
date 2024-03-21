@@ -684,67 +684,6 @@ feats <- c("nFeature_RNA", "nCount_RNA", "percent_mito", "percent_ribo")
 ```
 
 
-# SLIDE FIRST ROUND (all data)
-
-
-```{r}
-################################################################################
-########## KEEPING HIGH VARIANCE TUMOR X
-################################################################################
-df_x = tum_seurat_clean_clust@assays$RNA[,]
-# to get the variance you apply with axis = 2 (columns)
-col_variance = apply(df_x, 2, var)
-#do the same for CV
-means = apply(X=df_x, FUN=mean, MARGIN=2)
-coef = (sqrt(col_variance)/means)*100
-# to filter the columns based on being in a certain quantile
-col_high_variance = unique(which(coef< quantile(coef,prob=0.75) & col_variance > quantile(col_variance, prob=0.25)))
-# to get the variance you apply with axis = 2 (columns)
-row_variance = apply(df_x, 1, var)
-#do the same for CV
-row_means = apply(X=df_x, FUN=mean, MARGIN=1)
-coef_rows = (sqrt(row_variance)/row_means)*100
-#rows high var
-rows_high_variance = unique(which(coef_rows< quantile(coef,prob=0.75) & row_variance > quantile(row_variance, prob=0.25)))
-
-uniq_names_dln = rownames(tum_seurat_clean_clust)[rows_high_variance]
-df_x = df_x[rows_high_variance, col_high_variance]
-
-df_x = t(df_x) 
-rownames(df_x) = colnames(tum_seurat_clean_clust)[col_high_variance]
-colnames(df_x) = rownames(tum_seurat_clean_clust)[rows_high_variance]
-
-rownames_df_x = data.frame(colnames(tum_seurat_clean_clust)[col_high_variance])
-colnames(rownames_df_x) = c('cells')
-df_x  = cbind(rownames_df_x, df_x)
-
-write.csv(df_x, '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/Tumor/tum_ER_X.csv', row.names=FALSE)
-```
-
-```{r}
-################################################################################
-########## KEEPING HIGH VARIANCE TUMOR Y
-################################################################################
-
-str_label = tum_seurat_clean_clust@meta.data$label[col_high_variance]
-
-PD1_T_ind = which(str_label=="3-PD1-T")
-SP_T_ind = which(str_label=="4-SP-T")
-
-str_label[PD1_T_ind] = 1
-str_label[SP_T_ind] = 0
-df_tum_y = data.frame(str_label)
-
-uniq_names_tum_y = colnames(tum_seurat_clean_clust)[col_high_variance]
-cells_df_tum = data.frame(uniq_names_tum_y)
-colnames(cells_df_tum) = c('Labels')
-rownames(cells_df_tum) = uniq_names_tum_y
-df_tum_y = cbind(cells_df_tum, df_tum_y)
-
-write.csv(df_tum_y, '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/Tumor/tum_ER_y.csv', row.names=FALSE)
-```
-
-
 # CODE TO GENERATE SLIDE INPUT FOR EACH CELL TYPE
 
 
@@ -860,31 +799,6 @@ for (i in cell_types){
 #write.csv(to_plot_control, paste0('/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/dln_only_immune_var.csv'))
 #ggplot(data = to_plot_control)+geom_violin(aes(y=Genes_variance, x=factor(Group), group=Cell_type, fill=factor(Group)), draw_quantiles = c(0.25, 0.5, 0.75))
 ```
-
-```{r}
-################################################################################
-########## KEEPING HIGH VARIANCE DLN Y
-################################################################################
-
-str_label = dataset_only_immun_obj@meta.data$label[col_high_variance]
-
-control_group_ind = which(str_label=="1-PD1-LN")
-experimental_group_ind = which(str_label=="2-SP-LN")
-
-str_label[control_group_ind] = 0
-str_label[experimental_group_ind] = 1
-df_dln_y = data.frame(str_label)
-
-uniq_names_dln_y = colnames(dataset_only_immun_obj)[col_high_variance]
-cells_df_dln = data.frame(uniq_names_dln_y)
-colnames(cells_df_dln) = c('Labels')
-rownames(cells_df_dln) = uniq_names_dln_y
-df_dln_y = cbind(cells_df_dln, df_dln_y)
-
-
-write_csv(df_dln_y, '/ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/dln_only_immune_ER_y.csv')
-```
-
 
 #  Code to check slide input files, WE HIGHLY RECOMMEND RUNNING THIS CHUNCK BEFORE SUBMITING DATA TO SLIDE
 

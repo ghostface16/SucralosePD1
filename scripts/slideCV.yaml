@@ -1,0 +1,33 @@
+x_path: /ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/cell_type_wise_tum/CD8_T_cells/mini.csv
+y_path: /ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/cell_type_wise_tum/CD8_T_cells/mini_y.csv
+#z_path : /ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/cell_type_wise_tum/CD8_T_cells/z_matrix.csv
+out_path : /ix/djishnu/Zak/Splenda_study/RNASeq_Raw_Data/ANALYSIS/SLIDE/cell_type_wise_tum/CD8_T_cells/
+#k: 5
+delta: 0.1
+lambda: 1
+y_factor: TRUE
+y_levels: [0,1]
+rep_cv: 100
+nreps: 10
+eval_type: "auc"
+alpha_level: 0.05
+thresh_fdr: 0.5
+lasso: FALSE
+pcr: FALSE
+plsr: FALSE
+std_cv: TRUE
+std_y: TRUE
+permute: TRUE
+benchmark: FALSE
+fdr: 0.1
+spec: 0.5
+ncore: 64
+f_size: 20
+method: 4
+niter: 20
+parallel: TRUE
+SLIDE_iter: 50
+do_interacts: TRUE
+CViter: 100
+SLIDE_top_feats: 15
+
